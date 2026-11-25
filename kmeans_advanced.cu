@@ -27,7 +27,7 @@ __host__ __device__ static inline float dist2(float px, float py, float cx, floa
     return dx * dx + dy * dy;
 }
 
-// Carga puntos (x,y) desde un archivo CSV 
+// Carga puntos (x,y) desde un archivo CSV
 int load_csv(const char *filename, float **out_points)
 {
     FILE *f = fopen(filename, "r");
@@ -61,23 +61,39 @@ int load_csv(const char *filename, float **out_points)
     return count;
 }
 
+// Guarda etiquetas de una iteración en CSV
+void save_labels_csv(const char *prefix, int it, const float *points, const int *labels, int N)
+{
+    char fname[256];
+    snprintf(fname, sizeof(fname), "%s_iter_%d.csv", prefix, it);
+    FILE *f = fopen(fname, "w");
+    if (!f)
+    {
+        printf("Error creando %s\n", fname);
+        exit(1);
+    }
+    fprintf(f, "x,y,label\n");
+    for (int i = 0; i < N; i++)
+    {
+        fprintf(f, "%.4f,%.4f,%d\n", points[2 * i], points[2 * i + 1], labels[i]);
+    }
+    fclose(f);
+}
+
 // KERNEL GPU
 
-// SoA + centroides en __shared__ + acumulación en registros + reducción en árbol + 1 atomicAdd por bloque
 __global__ void assign_and_accumulate_gpu(
-    const float *px,        // Coordenadas X contiguas (SoA)
-    const float *py,        // Coordenadas Y contiguas (SoA)
-    const float *centroids, // Centroides actuales (K*2)
-    int *labels,            // Etiqueta asignada a cada punto (tamaño N)
-    float *d_sum_x,         // Suma global de X por clúster (tamaño K)
-    float *d_sum_y,         // Suma global de Y por clúster (tamaño K)
-    int *d_count,           // Conteo global de puntos por clúster (tamaño K)
+    const float *px,
+    const float *py,
+    const float *centroids,
+    int *labels,
+    float *d_sum_x,
+    float *d_sum_y,
+    int *d_count,
     int N, int K)
 {
-    // Centroides en memoria compartida estática
     __shared__ float s_centroids[MAX_K * 2];
 
-    // Memoria compartida dinámica para la reducción en árbol
     extern __shared__ float smem[];
     float *s_sum_x = smem;
     float *s_sum_y = smem + blockDim.x;
@@ -105,7 +121,7 @@ __global__ void assign_and_accumulate_gpu(
         my_count[c] = 0;
     }
 
-    // Grid-stride loop con acceso coalescido
+    // Grid-stride loop con acceso coalescido (SoA)
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
 
@@ -131,7 +147,6 @@ __global__ void assign_and_accumulate_gpu(
 
         labels[i] = best_c;
 
-        // Bucle desenrollado de tamaño fijo para evitar volcado a memoria local
         #pragma unroll
         for (int c = 0; c < MAX_K; c++)
         {
@@ -144,7 +159,7 @@ __global__ void assign_and_accumulate_gpu(
         }
     }
 
-    // Reducción en árbol por bloque para cada clúster
+    // Reducción en árbol por bloque + 1 atomicAdd global por bloque y clúster
     for (int c = 0; c < K; c++)
     {
         s_sum_x[tid] = my_sum_x[c];
@@ -163,7 +178,6 @@ __global__ void assign_and_accumulate_gpu(
             __syncthreads();
         }
 
-        // Solo el hilo 0 del bloque actualiza memoria global
         if (tid == 0 && s_count[0] > 0)
         {
             atomicAdd(&d_sum_x[c], s_sum_x[0]);
@@ -175,25 +189,19 @@ __global__ void assign_and_accumulate_gpu(
 }
 
 // FUNCIONES CPU
-void assign_clusters_cpu(
-    const float *points,
-    const float *centroids,
-    int *labels,
-    int N, int K)
+
+void assign_clusters_cpu(const float *points, const float *centroids, int *labels, int N, int K)
 {
     for (int i = 0; i < N; i++)
     {
         float px = points[2 * i];
         float py = points[2 * i + 1];
-
         float best_dist = FLT_MAX;
         int best_c = 0;
 
         for (int c = 0; c < K; c++)
         {
-            float cx = centroids[2 * c];
-            float cy = centroids[2 * c + 1];
-            float d = dist2(px, py, cx, cy);
+            float d = dist2(px, py, centroids[2 * c], centroids[2 * c + 1]);
             if (d < best_dist)
             {
                 best_dist = d;
@@ -204,11 +212,7 @@ void assign_clusters_cpu(
     }
 }
 
-float update_centroids_cpu(
-    const float *points,
-    float *centroids,
-    const int *labels,
-    int N, int K)
+float update_centroids_cpu(const float *points, float *centroids, const int *labels, int N, int K)
 {
     float *sum = (float *)calloc(K * 2, sizeof(float));
     int *count = (int *)calloc(K, sizeof(int));
@@ -251,12 +255,7 @@ float update_centroids_cpu(
     return movement;
 }
 
-void kmeans_cpu_ref(
-    const float *points,
-    float *centroids,
-    int N, int K,
-    int max_iters,
-    float epsilon)
+void kmeans_cpu_ref(const float *points, float *centroids, int N, int K, int max_iters, float epsilon)
 {
     int *labels = (int *)malloc((size_t)N * sizeof(int));
     if (!labels)
@@ -272,11 +271,10 @@ void kmeans_cpu_ref(
         if (movement < epsilon)
             break;
     }
-
     free(labels);
 }
 
-// K-MEANS GPU
+//K-MEANS GPU
 
 void kmeans_gpu_advanced(
     const float *points,
@@ -286,6 +284,7 @@ void kmeans_gpu_advanced(
     float epsilon,
     int blockSize,
     int requestedBlocks,
+    const char *export_prefix, // NULL en benchmark => cero overhead extra
     float *out_total_ms,
     float *out_kernel_ms)
 {
@@ -295,14 +294,14 @@ void kmeans_gpu_advanced(
         exit(1);
     }
 
-    // Reordenamiento único de AoS -> SoA antes del ciclo iterativo
     float *h_px = (float *)malloc((size_t)N * sizeof(float));
     float *h_py = (float *)malloc((size_t)N * sizeof(float));
     float *h_sum_x = (float *)malloc((size_t)K * sizeof(float));
     float *h_sum_y = (float *)malloc((size_t)K * sizeof(float));
     int   *h_count = (int *)malloc((size_t)K * sizeof(int));
+    int   *h_labels = export_prefix ? (int *)malloc((size_t)N * sizeof(int)) : NULL;
 
-    if (!h_px || !h_py || !h_sum_x || !h_sum_y || !h_count)
+    if (!h_px || !h_py || !h_sum_x || !h_sum_y || !h_count || (export_prefix && !h_labels))
     {
         printf("Error reservando memoria en host\n");
         exit(1);
@@ -314,7 +313,25 @@ void kmeans_gpu_advanced(
         h_py[i] = points[2 * i + 1];
     }
 
-    // Reserva única en memoria de GPU
+    FILE *f_cent = NULL;
+    if (export_prefix)
+    {
+        char fname[256];
+        snprintf(fname, sizeof(fname), "%s_centroids.csv", export_prefix);
+        f_cent = fopen(fname, "w");
+        if (!f_cent)
+        {
+            printf("Error creando %s\n", fname);
+            exit(1);
+        }
+        fprintf(f_cent, "iter,cluster,x,y\n");
+        // Guarda las semillas iniciales como iter = -1
+        for (int c = 0; c < K; c++)
+        {
+            fprintf(f_cent, "-1,%d,%.6f,%.6f\n", c, centroids[2 * c], centroids[2 * c + 1]);
+        }
+    }
+
     float *d_px = NULL, *d_py = NULL, *d_centroids = NULL;
     float *d_sum_x = NULL, *d_sum_y = NULL;
     int   *d_labels = NULL, *d_count = NULL;
@@ -333,11 +350,9 @@ void kmeans_gpu_advanced(
     check_cuda(cudaMalloc((void **)&d_sum_y, k_float_bytes), "cudaMalloc d_sum_y");
     check_cuda(cudaMalloc((void **)&d_count, k_int_bytes), "cudaMalloc d_count");
 
-    // Copia única de los puntos SoA a GPU
     check_cuda(cudaMemcpy(d_px, h_px, coord_bytes, cudaMemcpyHostToDevice), "H2D d_px");
     check_cuda(cudaMemcpy(d_py, h_py, coord_bytes, cudaMemcpyHostToDevice), "H2D d_py");
 
-    // Selección de bloques basada en los SMs reales de la GPU
     int numSMs = 0;
     check_cuda(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0), "Get numSMs");
 
@@ -363,15 +378,12 @@ void kmeans_gpu_advanced(
 
     for (int it = 0; it < max_iters; it++)
     {
-        // Limpiar acumuladores globales en GPU (solo K elementos cada uno)
         check_cuda(cudaMemset(d_sum_x, 0, k_float_bytes), "Memset d_sum_x");
         check_cuda(cudaMemset(d_sum_y, 0, k_float_bytes), "Memset d_sum_y");
         check_cuda(cudaMemset(d_count, 0, k_int_bytes), "Memset d_count");
 
-        // Copiar los K centroides actuales a GPU
         check_cuda(cudaMemcpy(d_centroids, centroids, centroids_bytes, cudaMemcpyHostToDevice), "H2D d_centroids");
 
-        // Ejecutar kernel fusionado con memoria compartida dinámica para reducción en árbol
         check_cuda(cudaEventRecord(start_k, 0), "Record start_k");
         assign_and_accumulate_gpu<<<numBlocks, blockSize, shared_bytes>>>(
             d_px, d_py, d_centroids, d_labels, d_sum_x, d_sum_y, d_count, N, K);
@@ -383,12 +395,10 @@ void kmeans_gpu_advanced(
         check_cuda(cudaEventElapsedTime(&iter_k_ms, start_k, stop_k), "Elapsed kernel");
         total_kernel_ms += iter_k_ms;
 
-        // Traer únicamente los K totales reducidos 
         check_cuda(cudaMemcpy(h_sum_x, d_sum_x, k_float_bytes, cudaMemcpyDeviceToHost), "D2H d_sum_x");
         check_cuda(cudaMemcpy(h_sum_y, d_sum_y, k_float_bytes, cudaMemcpyDeviceToHost), "D2H d_sum_y");
         check_cuda(cudaMemcpy(h_count, d_count, k_int_bytes, cudaMemcpyDeviceToHost), "D2H d_count");
 
-        // Dividir los K centroides y evaluar convergencia en O(K)
         float movement = 0.0f;
         for (int c = 0; c < K; c++)
         {
@@ -409,6 +419,17 @@ void kmeans_gpu_advanced(
             centroids[2 * c + 1] = newy;
         }
 
+        // Exportación para GIF
+        if (export_prefix)
+        {
+            check_cuda(cudaMemcpy(h_labels, d_labels, labels_bytes, cudaMemcpyDeviceToHost), "D2H d_labels export");
+            save_labels_csv(export_prefix, it, points, h_labels, N);
+            for (int c = 0; c < K; c++)
+            {
+                fprintf(f_cent, "%d,%d,%.6f,%.6f\n", it, c, centroids[2 * c], centroids[2 * c + 1]);
+            }
+        }
+
         printf("Iteration %d - centroid movement = %.6f\n", it, movement);
 
         if (movement < epsilon)
@@ -423,7 +444,7 @@ void kmeans_gpu_advanced(
     check_cuda(cudaEventElapsedTime(out_total_ms, start_total, stop_total), "Elapsed total");
     *out_kernel_ms = total_kernel_ms;
 
-    // Liberación limpia de memoria
+    if (f_cent) fclose(f_cent);
     cudaEventDestroy(start_total);
     cudaEventDestroy(stop_total);
     cudaEventDestroy(start_k);
@@ -440,9 +461,9 @@ void kmeans_gpu_advanced(
     free(h_sum_x);
     free(h_sum_y);
     free(h_count);
+    if (h_labels) free(h_labels);
 }
 
-// Verifica los centroides GPU contra CPU e imprime el error absoluto máximo
 bool verify(const float *centroids_gpu, const float *centroids_cpu, int K, float tol)
 {
     float max_err = 0.0f;
@@ -471,17 +492,18 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        printf("Usage: %s data.csv [blockSize] [numBlocks]\n", argv[0]);
+        printf("Usage: %s data.csv [blockSize] [numBlocks] [exportPrefix|-] [K]\n", argv[0]);
         return 1;
     }
 
     int blockSize = 256;
-    int requestedBlocks = 0; // 0 => automático (32 * numSMs)
+    int requestedBlocks = 0;
+    const char *export_prefix = NULL;
+    int K = 3;
 
     if (argc >= 3)
     {
         blockSize = atoi(argv[2]);
-        // La reducción en árbol requiere que blockSize sea potencia de 2 (32, 64, 128, 256, 512, 1024)
         if (blockSize <= 0 || blockSize > 1024 || (blockSize & (blockSize - 1)) != 0)
         {
             printf("Error: blockSize debe ser potencia de 2 entre 1 y 1024\n");
@@ -491,9 +513,22 @@ int main(int argc, char **argv)
     if (argc >= 4)
     {
         requestedBlocks = atoi(argv[3]);
-        if (requestedBlocks <= 0)
+        if (requestedBlocks < 0)
         {
-            printf("Error: numBlocks debe ser > 0\n");
+            printf("Error: numBlocks debe ser >= 0 (0 = automatico)\n");
+            return 1;
+        }
+    }
+    if (argc >= 5 && strcmp(argv[4], "-") != 0)
+    {
+        export_prefix = argv[4];
+    }
+    if (argc >= 6)
+    {
+        K = atoi(argv[5]);
+        if (K < 2 || K > MAX_K)
+        {
+            printf("Error: K debe estar entre 2 y %d\n", MAX_K);
             return 1;
         }
     }
@@ -503,18 +538,36 @@ int main(int argc, char **argv)
     if (N <= 0)
         return 1;
 
-    int K = 3;
-    float centroids_gpu[6] = {0, 0, 5, 5, 10, 10};
-    float centroids_cpu[6] = {0, 0, 5, 5, 10, 10};
+    float centroids_gpu[MAX_K * 2];
+    float centroids_cpu[MAX_K * 2];
 
-    printf("Loaded %d points.\n", N);
+    // Para K=3 conservamos las semillas del ejemplo
+    // para otros K tomamos K puntos espaciados deterministamente del dataset.
+    if (K == 3)
+    {
+        float init3[6] = {0, 0, 5, 5, 10, 10};
+        memcpy(centroids_gpu, init3, sizeof(init3));
+        memcpy(centroids_cpu, init3, sizeof(init3));
+    }
+    else
+    {
+        for (int c = 0; c < K; c++)
+        {
+            int idx = (int)(((long long)c * N) / K);
+            centroids_gpu[2 * c]     = points[2 * idx];
+            centroids_gpu[2 * c + 1] = points[2 * idx + 1];
+            centroids_cpu[2 * c]     = points[2 * idx];
+            centroids_cpu[2 * c + 1] = points[2 * idx + 1];
+        }
+    }
 
-    int max_iters = 10;
+    printf("Loaded %d points (K = %d).\n", N, K);
+
+    int max_iters = (K == 3) ? 10 : 50;
     float ep = 1e-4f;
     float total_ms = 0.0f, kernel_ms = 0.0f;
 
-    // Ejecución en GPU
-    kmeans_gpu_advanced(points, centroids_gpu, N, K, max_iters, ep, blockSize, requestedBlocks, &total_ms, &kernel_ms);
+    kmeans_gpu_advanced(points, centroids_gpu, N, K, max_iters, ep, blockSize, requestedBlocks, export_prefix, &total_ms, &kernel_ms);
 
     printf("\nFinal centroids (GPU Advanced):\n");
     for (int c = 0; c < K; c++)
@@ -525,7 +578,6 @@ int main(int argc, char **argv)
     printf("\nTiempo total ciclo K-means (GPU Advanced): %.4f ms\n", total_ms);
     printf("Tiempo acumulado solo kernel (GPU Advanced): %.4f ms\n", kernel_ms);
 
-    // Verificación numérica contra referencia en CPU
     kmeans_cpu_ref(points, centroids_cpu, N, K, max_iters, ep);
     if (verify(centroids_gpu, centroids_cpu, K, 1e-3f))
     {
