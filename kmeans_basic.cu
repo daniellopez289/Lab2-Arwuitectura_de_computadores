@@ -6,7 +6,7 @@
 #include <string.h>
 #include <cuda_runtime.h>
 
-#define MAX_POINTS 10000000 // Máximo de puntos permitido
+#define MAX_POINTS 40000000 // Máximo de puntos permitido
 
 // Verifica errores de llamadas a la API de CUDA de forma clara
 void check_cuda(cudaError_t err, const char *msg)
@@ -18,7 +18,7 @@ void check_cuda(cudaError_t err, const char *msg)
     }
 }
 
-// Distancia euclidiana al cuadrado, para CPU como para GPU
+// Distancia euclidiana al cuadrado (CPU, GPU)
 __host__ __device__ static inline float dist2(float px, float py, float cx, float cy)
 {
     float dx = px - cx;
@@ -64,7 +64,7 @@ int load_csv(const char *filename, float **out_points)
 
 // Cada hilo calcula el centroide más cercano para un único punto i
 __global__ void assign_clusters_gpu(
-    const float *points,    // tamaño N*2 (formato AoS: x0,y0,x1,y1,...)
+    const float *points,    // tamaño N*2
     const float *centroids, // tamaño K*2
     int *labels,            // tamaño N
     int N, int K)
@@ -198,7 +198,7 @@ void kmeans_cpu_ref(
     free(labels);
 }
 
-// K-MEANS GPU
+// K-MEANS GPU BÁSICO
 
 void kmeans_gpu_basic(
     const float *points,
@@ -217,6 +217,17 @@ void kmeans_gpu_basic(
         exit(1);
     }
 
+    // Eventos CUDA para medir tiempo real
+    cudaEvent_t start_total, stop_total, start_k, stop_k;
+    check_cuda(cudaEventCreate(&start_total), "EventCreate start_total");
+    check_cuda(cudaEventCreate(&stop_total), "EventCreate stop_total");
+    check_cuda(cudaEventCreate(&start_k), "EventCreate start_k");
+    check_cuda(cudaEventCreate(&stop_k), "EventCreate stop_k");
+
+    float total_kernel_ms = 0.0f;
+
+    check_cuda(cudaEventRecord(start_total, 0), "Record start_total");
+
     // Reserva única en GPU para todo el algoritmo
     float *d_points = NULL, *d_centroids = NULL;
     int *d_labels = NULL;
@@ -228,29 +239,18 @@ void kmeans_gpu_basic(
     check_cuda(cudaMalloc((void **)&d_centroids, centroids_bytes), "cudaMalloc d_centroids");
     check_cuda(cudaMalloc((void **)&d_labels, labels_bytes), "cudaMalloc d_labels");
 
-    // Los puntos se copian a GPU una sola vez antes del ciclo
+    // Los puntos no cambian: se copian a GPU una sola vez antes del ciclo
     check_cuda(cudaMemcpy(d_points, points, points_bytes, cudaMemcpyHostToDevice), "H2D d_points");
 
     int numBlocks = (N + blockSize - 1) / blockSize;
     printf("Configuracion GPU Basica: numBlocks = %d, blockSize = %d\n", numBlocks, blockSize);
 
-    // Eventos para medir tiempo real
-    cudaEvent_t start_total, stop_total, start_k, stop_k;
-    check_cuda(cudaEventCreate(&start_total), "EventCreate start_total");
-    check_cuda(cudaEventCreate(&stop_total), "EventCreate stop_total");
-    check_cuda(cudaEventCreate(&start_k), "EventCreate start_k");
-    check_cuda(cudaEventCreate(&stop_k), "EventCreate stop_k");
-
-    float total_kernel_ms = 0.0f;
-
-    check_cuda(cudaEventRecord(start_total, 0), "Record start_total");
-
     for (int it = 0; it < max_iters; it++)
     {
-        // Enviar centroides actuales a GPU
+        // 1. Enviar centroides actuales a GPU
         check_cuda(cudaMemcpy(d_centroids, centroids, centroids_bytes, cudaMemcpyHostToDevice), "H2D d_centroids");
 
-        // Asignación en GPU
+        // 2. Asignación paralela en GPU
         check_cuda(cudaEventRecord(start_k, 0), "Record start_k");
         assign_clusters_gpu<<<numBlocks, blockSize>>>(d_points, d_centroids, d_labels, N, K);
         check_cuda(cudaGetLastError(), "Kernel launch assign_clusters_gpu");
@@ -261,7 +261,7 @@ void kmeans_gpu_basic(
         check_cuda(cudaEventElapsedTime(&iter_k_ms, start_k, stop_k), "Elapsed kernel");
         total_kernel_ms += iter_k_ms;
 
-        // Traer etiquetas de vuelta a CPU y recalcular centroides secuencialmente
+        // 3. Traer etiquetas de vuelta a CPU y recalcular centroides secuencialmente
         check_cuda(cudaMemcpy(labels, d_labels, labels_bytes, cudaMemcpyDeviceToHost), "D2H d_labels");
         float movement = update_centroids_cpu(points, centroids, labels, N, K);
 
@@ -279,6 +279,7 @@ void kmeans_gpu_basic(
     check_cuda(cudaEventElapsedTime(out_total_ms, start_total, stop_total), "Elapsed total");
     *out_kernel_ms = total_kernel_ms;
 
+    // Liberación limpia de recursos
     cudaEventDestroy(start_total);
     cudaEventDestroy(stop_total);
     cudaEventDestroy(start_k);
@@ -337,11 +338,12 @@ int main(int argc, char **argv)
 
     printf("Loaded %d points.\n", N);
 
+
     int max_iters = 10;
     float ep = 1e-4f;
     float total_ms = 0.0f, kernel_ms = 0.0f;
 
-    // Ejecución en GPU
+    // Ejecución en GPU (versión básica)
     kmeans_gpu_basic(points, centroids_gpu, N, K, max_iters, ep, blockSize, &total_ms, &kernel_ms);
 
     printf("\nFinal centroids (GPU Basic):\n");
@@ -353,7 +355,7 @@ int main(int argc, char **argv)
     printf("\nTiempo total ciclo K-means (GPU Basic): %.4f ms\n", total_ms);
     printf("Tiempo acumulado solo kernel (GPU Basic): %.4f ms\n", kernel_ms);
 
-    // Verificación numérica
+    // 2. Verificación numérica contra referencia en CPU
     kmeans_cpu_ref(points, centroids_cpu, N, K, max_iters, ep);
     if (verify(centroids_gpu, centroids_cpu, K, 1e-4f))
     {

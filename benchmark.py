@@ -7,6 +7,7 @@ DATASET = "large_input.csv"
 BLOCK_SIZES = [32, 64, 128, 256, 512, 1024]
 REPEATS = 5
 VERSIONS = [
+    ("normal", "./kmeans_cpu"),
     ("basic", "./kmeans_basic"),
     ("advanced", "./kmeans_advanced"),
 ]
@@ -41,7 +42,7 @@ print(f"Iniciando benchmark sobre {DATASET} ({REPEATS} repeticiones por configur
 for version, exe in VERSIONS:
     for bs in BLOCK_SIZES:
         try:
-            # 1 corrida de calentamiento (no se guarda)
+            # corrida de calentamiento (no se guarda)
             run_once(exe, bs)
 
             totals = []
